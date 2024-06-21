@@ -1,0 +1,14 @@
+[package]
+name = "flecsy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flecsys = { path = "crates/flecsys" }
+bitflags = { version = "*" }
+ffi-closure = { version = "*" }
+[dev-dependencies]
+flecsys = { path = "crates/flecsys" }
+
+[workspace]
+members = ["crates/*"]

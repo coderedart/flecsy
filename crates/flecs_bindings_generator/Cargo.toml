@@ -1,0 +1,15 @@
+[package]
+name = "flecs_bindings_generator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bindgen = { version = "*" }
+syn = { version = "2", features = ["full", "printing", "fold"] }
+quote = "1"
+proc-macro2 = { version = "*", features = ["span-locations"] }
+elementtree = { version = "*" }
+heck = "*"
+anyhow = { version = "*" }
+prettyplease = { version = "*" }
+bimap = { version = "*" }

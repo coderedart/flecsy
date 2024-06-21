@@ -1,0 +1,6 @@
+[book]
+authors = ["Red Artist"]
+language = "en"
+multilingual = false
+src = "src"
+title = "flecsy"
