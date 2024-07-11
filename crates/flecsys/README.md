@@ -1,11 +1,6 @@
-To generate bindings, change into this directory and use
-```sh
-bindgen --merge-extern-blocks --default-enum-style rust --no-layout-tests -o bindings.rs flecs.h
-```
-
 To select all the constants at once, use `^pub const (ecs|flecs).*;` regex.
 
-These following functions have `usize` in their signature. wasm32 bindings will be interacting with a 64bit host application, so manually change usize to u64 in these fns to make sure that bindings match on both sides.
+These following functions have `usize` in their signature. 
 ```rust
 ecs_record_get_by_column
 ecs_set_id
@@ -22,9 +17,7 @@ ecs_cpp_component_register_explicit
 
 
 
-
-
-For wasm runtimes to interact with your native host ECS, there's a few pitfalls that you need to be aware of.
+## Scripting problems
 
 ### Native Sized Integers
 `usize` is a footgun as most wasm guests are `wasm32` (32bit) and their usize is usually `u32`.
@@ -59,25 +52,31 @@ The real problem is that we cannot *trust* the guests to do the right thing. Eit
 In lua/Luau, guests can't change the pointer value. But they can take a `const char *` and pass it to an API expecting `char *` to modify readonly values. Or they can pass it to an API expecting `* some_ecs_struct_t` with a random length to trigger OOB access/writes.
 In wasm, they can simply cast the bits of an integer into a pointer and pass it to your API.
 
-We can resolve this with a few different solutions
-1. **fix**: Change the bindings API to return a copy of the data. eg: strings or byte arrays. This requires wasm guests to expose allocators so that you can allocate/write into their memory. This is very useful when the guest need the "data" (bytes of plain old data or strings)
-2. **fix**: Wrap the pointers into garbage collectable "owned" objects. eg: resources in wasm. This has a cost via GC pressure. This is more useful when you need to pass "ownership" of a pointer rather than just raw data. The best examples are probably iterators or Vec like containers or even a graphics resource like `GlBuffer`. 
-3. **fix**: Keep a generation-based arena (eg: `slotmap`) where you can store the host pointers, and give a key into the arena as 32bit pointer to the guests. In all the API functions where you use the pointers, just get the actual pointer from arena. When its time to remove that pointer, just delete it from the arena, so that when the key is used again, you can simply error. This is transparent to both guests and hosts, so you don't need to change any API. 
+So, avoid passing raw host pointers to guests (or taking them as arguments from guest).
 
-**Quirks**: 
-1. First method is simple, but can only be used for simpler data.
-2. Second method works with ownership, so it can't help you when you are borrowing pointers. eg: a pointer might only be valid within a callback. In these cases, you can try using some sort of "scoped" pattern. `mlua` provides a scope, and any data create inside these scopes will be inaccessible to lua after you return from the scope. Wasm, unfortunately.. has no such functionality.
-3. Third method has issues when data is temporary. eg: a pointer only valid inside a callback. We would need to make sure that any time we are exiting a scope, we should remove all pointers that are invalidated. So, if wasm guests try to access a pointer using their key, they will simply fail. Its better to use separate arenas for owned and borrwed pointers. For all APIs dealing with temporary borrows, just clear the temp arena at the end of a function.
+### Copying host data to guest
+when we have to copy a few bytes to guest wasm, we need to first allocate memory inside guest. 
+Guests should usually expose some extern "C" functions to allocate/deallocate.
+We will also be copying a lot of "temporary" data. So, guests can probably export some sort of bump allocator, which we can reset every frame (or at the end of callback/scope). This would be faster.
+We would still need normal allocator API tho, when we return pointers that use `ecs_os_free` to explicitly free memory.
 
-### Restricting access with permissions
-All the previous problems were technical limitations or workarounds, but this is a logical problem. 
-An ECS has entities created by many guests and host.
-guests will simply have a id (eg: u32) and entities will have permission components that tell us whether this guest can read/modify it. 
-Individual permissions to precisely allow a guest to read/write. 
-1. `(ReadableBy, GuestId)`
-2. `(WriteableBy, GuestId)`
-Public Permissions tags which allow any host/guest to read/write to this entity.
-1. `PublicRead`
-2. `PublicWrite`
+### Accessing Host Data
+For simple value types like entities or booleans etc.., you can just pass to guest by value.
+For strings:
+    * For lua like managed languages, just create a new lua string and return that.
+    * For wasm, allocate memory on guest and copy the string data. Finally, pass the pointer to guest memory (should be 32bit) to wasm.
 
-Host API will validate these at runtime so that guests won't touch entities they don't access to. A lot of host entities like `Position` or `Color` would be public readable so that guests can access these components and add them to their entities.
+For `const void *`, like pointers to an entity's component data (eg: `ecs_get_id`), 
+    * The easy method would be to convert the component to json and pass it to guests. mlua already provides json -> lua conversion built-in. wasm can just take a string and deserialize it on guest side. may not be fast enough tho. 
+    * We can copy the bytes to guest and provide the pointer (just like strings), then guests can somehow to actually parse the bytes. useful for POD types like `Vec3` or `Point` or `Color` etc.. Although, this won't work when the data is not ABI-stable or might have indirections (eg: HashMap<String, String>).
+    * The final over-engineered solution would be to simply store a host component pointer on host side in some arena (`slotmap`?), provide the index of the "host pointer" as "pointer" to the guest. Then, guest can use the meta (flecs reflection) functions, to view/edit data. We will have to make sure that this slot will be cleared or we run into the danger of use-after-free. eg: `ecs_get_id` to store the host pointer in a slot -> `ecs_delete` that entity -> use the slot now. Lifecycle of these mutations needs more consideration.
+
+For mutable `void *`, we need to copy the data from guest to host after some time. 
+
+### Queries/Iterators
+This is a great example of mutable access to component data. We will have to copy the bytes in/out, or use meta-cursor objects. The real issue would be the scope of the data.
+For simple copying of bytes in/out:
+    * when calling `ecs_query_next` to get the table, copy the full bytes of each component array to guest. If the terms are mutable (`out`), store those guest pointers in a slotmap. guest can call some sort of `ecs_data_flush` after writing to the component data, and we can copy those bytes back from guest into host. Then, pop the pointers from slotmap.
+For reflected components:
+    * I have no idea
+
