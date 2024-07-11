@@ -2,8 +2,14 @@ use anyhow::{bail, Context, Result};
 use proc_macro2::TokenStream;
 use quote::{quote, ToTokens, TokenStreamExt};
 use std::{collections::BTreeMap, fmt::Display, str::FromStr};
-use syn::{fold::Fold, Expr, ForeignItemFn, Ident, Item, StaticMutability, Type, TypeBareFn};
-
+use syn::{Expr, ForeignItemFn, Ident, Item, StaticMutability, Type};
+pub const EXPLICITLY_IGNORED_FNS: &[&str] = &[
+    "ecs_os_get_api",
+    "ecs_os_set_api",
+    "ecs_init",
+    "ecs_fini",
+    "ecs_mini",
+];
 pub struct GeneratorContext {
     /// By default, we will rename functions by stripping their prefix eg: `ecs_new` becomes `new` inside World struct
     /// This map allows you to override this behavior and specific the new name directly. eg: `ecs_new` -> `create`
@@ -49,18 +55,21 @@ pub fn generate_safe_wrappers(source: &str) -> Result<()> {
                                     || name.starts_with("ecs_log_")
                                     || name.starts_with("ecs_init_w_args")
                                     || name.starts_with("ecs_log")
-                                    || name.ends_with("_"))
+                                    || name.ends_with("_")
+                                    || EXPLICITLY_IGNORED_FNS.contains(&name.as_str()))
                             {
                                 match ExternFn::parse_from(&mut gtx, foreign_fn) {
                                     Ok(extern_fn) => {
-                                        extern_fns.push(extern_fn);
+                                        if let Some(extern_fn) = extern_fn {
+                                            extern_fns.push(extern_fn);
+                                        }
                                     }
                                     Err(e) => {
                                         println!("failed to parse fn {name}: {e}");
                                     }
                                 }
                             } else {
-                                println!("ignoring parsing fn {}", name);
+                                // println!("ignoring parsing fn {}", name);
                             }
                         }
                         syn::ForeignItem::Static(static_item) => {
@@ -75,7 +84,7 @@ pub fn generate_safe_wrappers(source: &str) -> Result<()> {
                                     })?,
                                 );
                             } else {
-                                println!("ignoring static {}", name);
+                                // println!("ignoring static {}", name);
                             }
                         }
                         _ => {}
@@ -94,31 +103,40 @@ pub fn generate_safe_wrappers(source: &str) -> Result<()> {
                             .with_context(|| format!("failed to parse item: {}", name))?,
                     );
                 } else {
-                    println!("ignoring constant {}", name);
+                    // println!("ignoring constant {}", name);
                 }
             }
             _ => {}
         }
     }
-    let mut stream = TokenStream::new();
-
-    for constant in constants {
-        let name = Ident::new(&constant.name, proc_macro2::Span::call_site());
-        stream.append_all(quote! {
-            pub use flecsys::#name as #name;
-        });
-    }
-    for s in statics {
-        let name = Ident::new(&s.name, proc_macro2::Span::call_site());
-        stream.append_all(quote! {
-            pub use flecsys:: #name as #name;
-        });
-    }
+    let mut stream = TokenStream::from_str(PREFIX_CODE).unwrap();
+    // lets deal with constants and statics later. They are just re-exported as is and not really interesting.
+    // for constant in constants {
+    //     let name = Ident::new(&constant.name, proc_macro2::Span::call_site());
+    //     stream.append_all(quote! {
+    //         pub use flecsys::#name as #name;
+    //     });
+    // }
+    // for s in statics {
+    //     let name = Ident::new(&s.name, proc_macro2::Span::call_site());
+    //     stream.append_all(quote! {
+    //         pub use flecsys:: #name as #name;
+    //     });
+    // }
     // all methods will be sent to the respective impl_stream of the opaque type
     // this will split const and mut methods into separate impls.
     let mut impl_streams = BTreeMap::new();
+    let mut skipped_fns = 0;
+    let mut total = 0;
     for f in extern_fns {
+        total += 1;
         if should_skip_generating_fn(&f) {
+            //         if f.link_name.starts_with("ecs_") && !(
+            //             f.link_name.starts_with("ecs_vec") ||
+            //             f.link_name.ends_with("_")
+            // ) {
+            skipped_fns += 1;
+            // }
             continue;
         }
         // if we reach this point, this is a method on an opaque struct
@@ -143,7 +161,7 @@ pub fn generate_safe_wrappers(source: &str) -> Result<()> {
         }
         // start fn definition
         fn_stream.append_all(quote! {
-            pub fn #name
+            fn #name
         });
         // create the args first, before we append them to the stream
         let mut args_stream = TokenStream::new();
@@ -202,22 +220,56 @@ pub fn generate_safe_wrappers(source: &str) -> Result<()> {
             .unwrap()
             .append_all(fn_stream);
     }
-    for (ty, impl_stream) in impl_streams.iter_mut() {
+    println!(
+        "skipped {skipped_fns} out of {total} functions",
+        skipped_fns = skipped_fns,
+        total = total
+    );
+    let mut mut_agnostic_impl_streams: BTreeMap<Types, TokenStream> = BTreeMap::new();
+    for (ty, impl_stream) in impl_streams {
+        let mut const_ty = ty.clone();
+        match &mut const_ty {
+            Types::Ptr { mutable, .. } => {
+                *mutable = false;
+            }
+            _ => {}
+        }
+        if let Some(mut_agnostic_impl_stream) = mut_agnostic_impl_streams.get_mut(&const_ty) {
+            mut_agnostic_impl_stream.append_all(impl_stream.into_iter());
+        } else {
+            mut_agnostic_impl_streams.insert(const_ty.clone(), impl_stream.clone());
+        }
+    }
+    for (ty, impl_stream) in mut_agnostic_impl_streams.iter_mut() {
         let rust_ty = ty.get_opaque_type().unwrap();
-        let mut ty = ty.clone();
-        match &mut ty {
-            Types::Ptr { ty, mutable } => {
+        let mut const_ty = ty.clone();
+        match &mut const_ty {
+            Types::Ptr { mutable, .. } => {
+                *mutable = false;
+            }
+            _ => {}
+        }
+        let mut mut_ty = ty.clone();
+        match &mut mut_ty {
+            Types::Ptr { mutable, .. } => {
                 *mutable = true;
             }
             _ => {}
         }
+        let rust_ty_trait = Ident::new(
+            &format!("{}Trait", rust_ty.to_string()),
+            proc_macro2::Span::call_site(),
+        );
+
+        let rust_ty_trait_manual = Ident::new(
+            &format!("{}TraitManual", rust_ty.to_string()),
+            proc_macro2::Span::call_site(),
+        );
         // we don't want to generate struct declaration twice for const and mut methods.
         // so, we only generate for mutable.
         stream.append_all(quote! {
-            pub struct #rust_ty {
-                ptr: #ty,
-            }
-            impl #rust_ty {
+
+            pub trait #rust_ty_trait: #rust_ty_trait_manual {
                 #impl_stream
             }
         });
@@ -225,10 +277,7 @@ pub fn generate_safe_wrappers(source: &str) -> Result<()> {
     let auto_bindigns = match syn::parse2(stream.clone()) {
         Ok(f) => prettyplease::unparse(&f),
         Err(e) => {
-            eprintln!(
-                "failed to format stream before writing to auto.rs
-            "
-            );
+            eprintln!("failed to format stream before writing to auto.rs {e}            ");
             stream.to_string()
         }
     };
@@ -242,35 +291,37 @@ fn should_skip_generating_fn(func: &ExternFn) -> bool {
         link_name,
         args,
         ret,
-        doc,
+        ..
     } = func;
-    if !link_name.starts_with("ecs") {
-        println!("ignoring fn {name}");
+    if !link_name.starts_with("ecs") || link_name.ends_with("_fini") {
+        // println!("ignoring fn {name} because it doesn't start with ecs or ends with fini");
         return true;
     }
 
     if args.iter().skip(1).map(|(_, ty)| ty).any(|arg_ty| {
-        if let Types::Ptr { ty, .. } = arg_ty {
-            // opaque types are fine, don't skip because of them
-            if arg_ty.get_opaque_type().is_some() {
-                false
-            } else {
-                // non opaque type pointers are a pain. so we skip them
-                true
-            }
-        } else {
-            false
+        if arg_ty.get_opaque_type().is_some() {
+            return false;
         }
+        if let Types::Ptr { ty, .. } = arg_ty {
+            match ty.as_ref() {
+                Types::I8 => {}
+                _ => return true,
+            }
+        }
+        false
     }) {
         println!("ignoring fn {name} because it takes pointer arg as input");
         return true;
     }
     // skip if return type is a pointer. we can't [always] know whether its owning or borrowing
     match ret {
-        Types::Ptr { .. } => {
-            println!("ignoring fn {name} because it returns a pointer");
-            return true;
-        }
+        Types::Ptr { ty, .. } => match ty.as_ref() {
+            Types::I8 => {}
+            _ => {
+                println!("ignoring fn {name} because it returns a pointer");
+                return true;
+            }
+        },
         Types::CType(c_ty) => match c_ty.as_str() {
             "ecs_ref_t" | "ecs_iter_t" => {
                 println!("ignoring fn {name} because it returns a {c_ty}");
@@ -312,8 +363,6 @@ pub enum Types {
     RustType(String),
     Ptr { ty: Box<Types>, mutable: bool },
     Ref { ty: Box<Types>, mutable: bool },
-    RefSelf,
-    MutSelf,
 }
 
 impl ToTokens for Types {
@@ -353,8 +402,6 @@ impl ToTokens for Types {
                     tokens.append_all(quote! { & #ty })
                 }
             }
-            Types::RefSelf => tokens.append_all(quote! { &self }),
-            Types::MutSelf => tokens.append_all(quote! { &mut self }),
             Types::RustType(rt) => {
                 let rt = Ident::new(rt, proc_macro2::Span::call_site());
                 tokens.append_all(quote! { #rt })
@@ -437,7 +484,11 @@ impl Types {
         return_ty_converter: &mut TokenStream,
     ) -> Result<()> {
         match self {
-            Types::Void => {}
+            Types::Void => {
+                return_ty_converter.append_all(quote! {
+                    let _ = result;
+                });
+            }
             Types::Bool
             | Types::U8
             | Types::U16
@@ -461,9 +512,17 @@ impl Types {
             Types::CType(c_ty) => {
                 match c_ty.as_str() {
                     // type aliases
-                    "ecs_id_t" | "ecs_entity_t" => {
+                    "ecs_id_t" => {
                         return_ty_specifier_stream.append_all(quote! {
-                            -> u64
+                            -> Id
+                        });
+                        return_ty_converter.append_all(quote! {
+                            return result;
+                        });
+                    }
+                    "ecs_entity_t" => {
+                        return_ty_specifier_stream.append_all(quote! {
+                            -> Entity
                         });
                         return_ty_converter.append_all(quote! {
                             return result;
@@ -471,7 +530,7 @@ impl Types {
                     }
                     "ecs_flags32_t" => {
                         return_ty_specifier_stream.append_all(quote! {
-                            -> u32
+                            -> Flags32
                         });
                         return_ty_converter.append_all(quote! {
                             return result;
@@ -479,7 +538,7 @@ impl Types {
                     }
                     "ecs_flags8_t" => {
                         return_ty_specifier_stream.append_all(quote! {
-                            -> u8
+                            -> Flags8
                         });
                         return_ty_converter.append_all(quote! {
                             return result;
@@ -487,7 +546,7 @@ impl Types {
                     }
                     "ecs_flags16_t" => {
                         return_ty_specifier_stream.append_all(quote! {
-                            -> u16
+                            -> Flags16
                         });
                         return_ty_converter.append_all(quote! {
                             return result;
@@ -495,6 +554,38 @@ impl Types {
                     }
 
                     _ => bail!("unknown c type {c_ty} in return type"),
+                }
+            }
+            Types::Ptr { ty, mutable } => {
+                if **ty == Types::I8 {
+                    if *mutable {
+                        return_ty_specifier_stream.append_all(quote! {
+                            -> Option<NullString>
+                        });
+                        return_ty_converter.append_all(quote! {
+                            if result.is_null() {
+                                return None;
+                            }
+                            let nstr = unsafe { NullStr::from_ptr(result)}.expect("failed to create null str from pointer").to_owned();
+                            unsafe {(flecsys::ecs_os_get_api().free_.unwrap())(result as *mut _)};
+                            Some(nstr)
+                        });
+                    } else {
+                        return_ty_specifier_stream.append_all(quote! {
+                            -> Option<&NullStr>
+                        });
+                        return_ty_converter.append_all(quote! {
+
+                        if result.is_null() {
+                            return None;
+                        }
+                        let nstr = unsafe { NullStr::from_ptr(result)}.expect("failed to create null str from pointer");
+                        unsafe {(flecsys::ecs_os_get_api().free_.unwrap())(result as *mut _)};
+                        Some(nstr)
+                    });
+                    }
+                } else {
+                    bail!("unknown ptr type {ty} in return type");
                 }
             }
             _ => bail!("unknown return type {self}"),
@@ -520,7 +611,7 @@ impl Types {
         arg_name: &Ident,
         args_stream: &mut TokenStream,
         args_converter_stream: &mut TokenStream,
-        gtx: &GeneratorContext,
+        _gtx: &GeneratorContext,
     ) -> Result<()> {
         match self {
             Types::Void => {
@@ -557,25 +648,36 @@ impl Types {
             Types::CType(c_ty) => {
                 match c_ty.as_str() {
                     // type aliases
-                    "ecs_id_t" | "ecs_entity_t" => {
+                    "ecs_id_t" => {
                         args_stream.append_all(quote! {
-                            #arg_name: u64,
+                            #arg_name: Id,
+                        });
+                        return Ok(());
+                    }
+                    "ecs_entity_t" => {
+                        args_stream.append_all(quote! {
+                            #arg_name: Entity,
                         });
                         return Ok(());
                     }
                     "ecs_flags32_t" => {
                         args_stream.append_all(quote! {
-                            #arg_name: u32,
+                            #arg_name: Flags32,
                         });
                     }
                     "ecs_flags8_t" => {
                         args_stream.append_all(quote! {
-                            #arg_name: u8,
+                            #arg_name: Flags8,
                         });
                     }
                     "ecs_flags16_t" => {
                         args_stream.append_all(quote! {
-                            #arg_name: u16,
+                            #arg_name: Flags16,
+                        });
+                    }
+                    "ecs_type_kind_t" => {
+                        args_stream.append_all(quote! {
+                            #arg_name: flecsys::ecs_type_kind_t,
                         });
                     }
                     rest => {
@@ -614,11 +716,11 @@ impl Types {
                             });
                             args_converter_stream.append_all(if mutable {
                                 quote! {
-                                    let #arg_name = self.ptr;
+                                    let #arg_name = self.as_ptr_mut();
                                 }
                             } else {
                                 quote! {
-                                    let #arg_name = self.ptr.cast_const();
+                                    let #arg_name = self.as_ptr();
                                 }
                             });
                         } else {
@@ -633,12 +735,25 @@ impl Types {
                             });
                             args_converter_stream.append_all(if mutable {
                                 quote! {
-                                    let #arg_name = #arg_name.ptr;
+                                    let #arg_name = #arg_name.as_ptr_mut();
                                 }
                             } else {
                                 quote! {
-                                    let #arg_name = #arg_name.ptr.cast_const();
+                                    let #arg_name = #arg_name.as_ptr();
                                 }
+                            });
+                        }
+                    }
+                    Self::I8 => {
+                        assert!(!first_arg);
+                        if mutable {
+                            unreachable!("mutable i8/char ptr as input");
+                        } else {
+                            args_stream.append_all(quote! {
+                                #arg_name: &NullStr,
+                            });
+                            args_converter_stream.append_all(quote! {
+                                let #arg_name = #arg_name.as_ptr();
                             });
                         }
                     }
@@ -648,49 +763,38 @@ impl Types {
             Types::Ref { .. } => {
                 bail!("Ref as c input parameter");
             }
-            Types::RefSelf | Types::MutSelf => {
-                bail!("Ref/MutSelf as c input parameter");
-            }
         }
         Ok(())
     }
     /// checks if self is an opaque type.
     fn get_opaque_type(&self) -> Option<Ident> {
-        let is_mutable;
         match self {
-            Types::Ptr { ty, mutable } => {
-                is_mutable = *mutable;
-                match ty.as_ref() {
-                    Types::CType(c_ty) => match c_ty.as_str() {
-                        "ecs_world_t"
-                        | "ecs_stage_t"
-                        | "ecs_table_t"
-                        | "ecs_id_record_t"
-                        | "ecs_table_record_t"
-                        | "ecs_mixins_t"
-                        | "ecs_data_t"
-                        | "ecs_query_cache_table_match_t"
-                        | "ecs_http_server_t"
-                        | "ecs_script_template_t" => {
-                            let rust_ty = c_ty
-                                .strip_prefix("ecs_")
-                                .unwrap()
-                                .strip_suffix("_t")
-                                .unwrap();
-                            return Some(Ident::new(
-                                &format!(
-                                    "{}{}",
-                                    heck::AsPascalCase(rust_ty),
-                                    if is_mutable { "Mut" } else { "Ref" }
-                                ),
-                                proc_macro2::Span::call_site(),
-                            ));
-                        }
-                        _ => {}
-                    },
+            Types::Ptr { ty, .. } => match ty.as_ref() {
+                Types::CType(c_ty) => match c_ty.as_str() {
+                    "ecs_world_t"
+                    | "ecs_stage_t"
+                    | "ecs_table_t"
+                    | "ecs_id_record_t"
+                    | "ecs_table_record_t"
+                    | "ecs_mixins_t"
+                    | "ecs_data_t"
+                    | "ecs_query_cache_table_match_t"
+                    | "ecs_http_server_t"
+                    | "ecs_script_template_t" => {
+                        let rust_ty = c_ty
+                            .strip_prefix("ecs_")
+                            .unwrap()
+                            .strip_suffix("_t")
+                            .unwrap();
+                        return Some(Ident::new(
+                            &format!("{}", heck::AsPascalCase(rust_ty),),
+                            proc_macro2::Span::call_site(),
+                        ));
+                    }
                     _ => {}
-                }
-            }
+                },
+                _ => {}
+            },
             _ => {}
         };
         None
@@ -720,8 +824,6 @@ impl Display for Types {
             Types::Ref { ty, mutable } => {
                 write!(f, "&{}{}", if *mutable { "mut " } else { "" }, ty)
             }
-            Types::RefSelf => write!(f, "&self"),
-            Types::MutSelf => write!(f, "&mut self"),
             Types::RustType(rt) => write!(f, "{}", rt),
         }
     }
@@ -790,7 +892,7 @@ impl ExternFn {
     pub fn parse_from(
         gtx: &mut GeneratorContext,
         foreign_fn: ForeignItemFn,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Option<Self>> {
         let link_name = foreign_fn.sig.ident.to_string();
         let name = gtx
             .explicit_rename_fns
@@ -810,8 +912,20 @@ impl ExternFn {
                 } else {
                     bail!("failed to parse paramter name {:#?}", typed.pat);
                 };
+                if typed.ty.to_token_stream().to_string().ends_with("action_t") {
+                    // ignore any fns that take closures
+                    return Ok(None);
+                }
                 match Types::parse_from_type_path(&typed.ty) {
                     Ok(ty) => {
+                        match &ty {
+                            Types::Ptr { ty, .. } => {
+                                if ty.as_ref() == &Types::Void {
+                                    return Ok(None);
+                                }
+                            }
+                            _ => {}
+                        }
                         args.push((arg_name, ty));
                     }
                     Err(e) => {
@@ -839,13 +953,13 @@ impl ExternFn {
             }
             None
         });
-        Ok(Self::new(
+        Ok(Some(Self::new(
             name,
             link_name,
             args,
             ret,
             doc.unwrap_or_default(),
-        ))
+        )))
     }
 }
 pub struct Constant {
@@ -873,104 +987,9 @@ impl Constant {
         Ok(Self::new(name, ty, doc.unwrap_or_default()))
     }
 }
-fn any_args_usize<'a>(args: impl IntoIterator<Item = &'a syn::FnArg>) -> bool {
-    for arg in args.into_iter() {
-        if let syn::FnArg::Typed(typed) = arg {
-            if let syn::Type::Path(path) = &*typed.ty {
-                if path.path.segments.last().unwrap().ident == "usize" {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-struct BindingsTransformer;
-impl Fold for BindingsTransformer {
-    fn fold_foreign_item_fn(&mut self, mut i: syn::ForeignItemFn) -> syn::ForeignItemFn {
-        let name = i.sig.ident.to_string();
-        if name.starts_with("ecs")
-            && (any_args_usize(&i.sig.inputs) || any_output_usize(&i.sig.output))
-        {
-            set_fn_usize_to_u64(&mut i);
-        }
-        i
-    }
-    fn fold_type_bare_fn(&mut self, mut i: syn::TypeBareFn) -> syn::TypeBareFn {
-        if any_bare_args_usize(&i.inputs) || any_output_usize(&i.output) {
-            set_bare_fn_usize_to_u64(&mut i);
-        }
-        i
-    }
-    fn fold_item_struct(&mut self, i: syn::ItemStruct) -> syn::ItemStruct {
-        i
-    }
-}
-fn any_bare_args_usize<'a>(args: impl IntoIterator<Item = &'a syn::BareFnArg>) -> bool {
-    for arg in args.into_iter() {
-        if let syn::Type::Path(path) = &arg.ty {
-            if path.path.segments.last().unwrap().ident == "usize" {
-                return true;
-            }
-        }
-    }
-    false
-}
-fn any_output_usize(output: &syn::ReturnType) -> bool {
-    match output {
-        syn::ReturnType::Type(_, ty) => match ty.as_ref() {
-            syn::Type::Path(t) => {
-                if t.path.segments.last().unwrap().ident == "usize" {
-                    return true;
-                }
-            }
-            _ => {}
-        },
-        _ => {}
-    }
-    false
-}
-fn replace_usize_with_u64(ty: &mut syn::Type) {
-    match ty {
-        syn::Type::Path(path) => {
-            if path.path.segments[0].ident == "usize" {
-                path.path.segments[0].ident = Ident::new("u64", path.path.segments[0].ident.span())
-            }
-        }
-        _ => {}
-    }
-}
-fn set_fn_usize_to_u64(i: &mut ForeignItemFn) {
-    i.sig.inputs = i
-        .sig
-        .inputs
-        .iter()
-        .cloned()
-        .map(|mut input| {
-            if let syn::FnArg::Typed(typed) = &mut input {
-                replace_usize_with_u64(&mut typed.ty);
-            }
-            input
-        })
-        .collect();
-    match &mut i.sig.output {
-        syn::ReturnType::Default => {}
-        syn::ReturnType::Type(_, ty) => replace_usize_with_u64(ty),
-    }
-}
 
-fn set_bare_fn_usize_to_u64(i: &mut TypeBareFn) {
-    i.inputs = i
-        .inputs
-        .iter()
-        .cloned()
-        .map(|mut input| {
-            replace_usize_with_u64(&mut input.ty);
-            input
-        })
-        .collect();
-    match &mut i.output {
-        syn::ReturnType::Default => {}
-        syn::ReturnType::Type(_, ty) => replace_usize_with_u64(ty),
-    }
-}
+const PREFIX_CODE: &str = r#"
+// This file is generated by flecs_bindings_generator
+use super::*;
+
+"#;

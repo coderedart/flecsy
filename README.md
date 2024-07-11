@@ -1,18 +1,17 @@
 # WARNING: WORK IN PROGRESS.
 
 
-This contains opinionated bindings for flecs. The main purpose is to enable scripting using wasmtime and mlua, while also sandboxing those addons (limit what addons can access or mutate in ECS).
+This contains opinionated bindings for flecs. The main purpose is to enable scripting using wasmtime, while also sandboxing those addons (limit what addons can access or mutate in ECS).
 
-There are some manual hand-written safe wrapperbindings in `src/lib.rs` and `src/world.rs`. But that work is on hold as It was a lot of duplicate boilerplate code. eg: `&CStr` wrapping/unwrapping for character strings or validating entity ids etc..
 
-I made a `null-terminated` utf-8 string type in `src/nullstr.rs` to make the bindings more ergonomic. But It feels like a waste of time to keep writing (and rewriting) these bindings manually by hand. 
+I made a `null-terminated` utf-8 string type in `src/nullstr.rs` to make the bindings more ergonomic.
 
 So, At *this* particular moment, I am trying to autogenerate bindings using `flecs-bindings-generator` crate. 
 * This will allow us to evolve bindings easily by just modifying a little code in the generator crate
 * We don't need to repeat boiler plate. Although AI can help to some extent, it will still be a lot of manual monkey typing.
 * We can switch the kinds of bindings generated based on our config. 
     * Wasm Guest: When generating bindings that wasm guests will use, we can skip certain functions (eg: ecs_fini or ecs_quit), as guests shouldn't be able to do that. 
-    * Wasm Host: This will generate boiler plate code that adds "host fns" to wasmtime linker (and wasmer in near future) that will connect to the guest bindings. But this time, we can add validation code like checking if the entity that is modified by the call is actually owned by the guest or return an error. There's LOTS of variations here. Another use case might be disallowing mutating fns when in readonly mode. Or not allowing fn calls when the plugin is in a different thread (assuming you only have ECS on main thread). This also requires us to think about passing in and out data by value, rather than pointers. 
+    * Wasm Host: This will generate boiler plate code that adds "host fns" to wasmtime linker (and wasmer in near future) that will connect to the guest bindings. But this time, we can add validation code like checking if the entity that is modified by the call is actually owned by the guest or return an error. There's LOTS of variations here. Another use case might be disallowing mutating fns when in readonly mode. Or not allowing fn calls when the plugin is in a different thread (async?). This also requires us to think about passing in and out data by value, rather than pointers. 
     * Host native: This is the usuall FFI bindings we do for any C library. Because we have direct access to memory of the c library, this is the simplest part. But it is also the most boring part.
     * Lua host: How do we expose ECS bindings to lua? We will have to use light user data as entities/ids, as luau doesn't support 64bit integers. We also need to be careful and not create too many temporary objects (increases GC pressure). How do we convert a simple component like `Position3` to luau? use inbuilt Vec3? or an array of floats? more such questions need to be answer for ergonomic bindings. 
     * Lua Guest: This is probably easier, as there's existing flecs-lua project by flecs dev. We can mostly use that as reference. 

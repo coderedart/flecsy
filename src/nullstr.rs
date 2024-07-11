@@ -96,7 +96,8 @@ impl Borrow<NullStr> for NullString {
 impl ToOwned for NullStr {
     type Owned = NullString;
     fn to_owned(&self) -> Self::Owned {
-        NullString(self.as_str().to_string())
+        // NOTE: make sure to not miss the null terminator or we break the rule that nullstring must have null terminator
+        NullString(self.as_str_with_null().to_string())
     }
 }
 impl NullStr {
@@ -148,9 +149,16 @@ impl NullStr {
             Err(_) => Err(s),
         }
     }
+    pub unsafe fn from_ptr<'a>(ptr: *const i8) -> Result<&'a Self, &'a CStr> {
+        let cstr = CStr::from_ptr(ptr);
+        Self::new_cstr(cstr)
+    }
 
     pub fn as_str(&self) -> &str {
         &self.0[..self.0.len() - 1]
+    }
+    pub fn as_str_with_null(&self) -> &str {
+        &self.0
     }
     pub fn as_ptr(&self) -> *const i8 {
         self.0.as_ptr() as *const i8

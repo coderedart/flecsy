@@ -2,13 +2,15 @@
 name = "flecsy"
 version = "0.1.0"
 edition = "2021"
+[lib]
+doctest = false
 
 [dependencies]
 flecsys = { path = "crates/flecsys" }
 bitflags = { version = "*" }
-ffi-closure = { version = "*" }
+tinyvec = {version = "*"}
 [dev-dependencies]
 flecsys = { path = "crates/flecsys" }
-
+rstest = { version = "*" }
 [workspace]
 members = ["crates/*"]
